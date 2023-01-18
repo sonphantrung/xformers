@@ -28,11 +28,7 @@ jobs:
       matrix:
         os:
           - ubuntu-22.04
-          - windows-2019
         python:
-          - "3.7"
-          - "3.8"
-          - "3.9"
           - "3.10"
         config:
           - torch_version: "1.13.1+cu117"
@@ -42,8 +38,8 @@ jobs:
             cuda_run_file: https://developer.download.nvidia.com/compute/cuda/11.7.1/local_installers/cuda_11.7.1_515.65.01_linux.run
             publish: true # publish only latest version
 
-          - torch_version: "1.12.1+cu116"
-            torch_version_constraint: "1.12.1"
+          - torch_version: "1.13.1+cu116"
+            torch_version_constraint: "1.13.1"
             cuda_version: "11.6.2"
             pip_index: https://download.pytorch.org/whl/cu116
             cuda_run_file: https://developer.download.nvidia.com/compute/cuda/11.6.2/local_installers/cuda_11.6.2_510.47.03_linux.run
@@ -82,13 +78,6 @@ jobs:
           sh ./cuda.run --silent --toolkit &&
           rm ./cuda.run
 
-      - if: runner.os == 'Windows'
-        name: (Windows) Setup Runner
-        uses: ./.github/actions/setup-windows-runner
-        with:
-          cuda: ${{ matrix.config.cuda_version }}
-          python: ${{ matrix.python }}
-
       - name: Define version
         run: |
           set -Eeuo pipefail
@@ -116,21 +105,4 @@ jobs:
         with:
           name: ${{ matrix.os }}-py${{ matrix.python }}-torch${{ matrix.config.torch_version }}
           path: dist/*.whl
-
-      - name: Upload wheel to PyPi
-        if: ${{ matrix.config.publish }}
-        run: $PY -m twine upload dist/*.whl
-        env:
-          TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
-
-      - name: Upload source distribution to PyPi
-        if: ${{ matrix.config.publish && matrix.sdist }}
-        run: |
-          rm -rf dist/
-          # unpin pytorch version
-          git checkout HEAD -- ./requirements.txt
-          $PY setup.py sdist -d sdist/
-          $PY -m twine upload sdist/*
-        env:
-          TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
 # Note: it might be helpful to have additional steps that test if the built wheels actually work
