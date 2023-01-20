@@ -1,9 +1,5 @@
 #ifdef HAS_PYTORCH
-#include <ATen/ATen.h>
-#include <ATen/cuda/CUDAContext.h>
 #include <ATen/cuda/CUDAGeneratorImpl.h>
-#include <c10/cuda/CUDAGuard.h>
-#include <torch/library.h>
 #include <ATen/cuda/CUDAGraphsUtils.cuh>
 #endif
 
@@ -20,7 +16,6 @@
 #include "cutlass/numeric_types.h"
 #include "cutlass/tensor_ref.h"
 
-#include "attention_scaling_coefs_updater.h"
 #include "cutlass/epilogue/threadblock/default_epilogue_simt.h"
 #include "cutlass/epilogue/threadblock/default_epilogue_tensor_op.h"
 #include "cutlass/epilogue/threadblock/default_epilogue_volta_tensor_op.h"
@@ -36,11 +31,11 @@
 #include "cutlass/platform/platform.h"
 #include "cutlass/transform/threadblock/predicated_tile_iterator.h"
 #include "debug_utils.h"
-#include "epilogue_pipelined.h"
-#include "epilogue_rescale_output.h"
-#include "find_default_mma.h"
+#include "epilogue/epilogue_pipelined.h"
+#include "epilogue/epilogue_rescale_output.h"
+#include "gemm/find_default_mma.h"
+#include "gemm/mma_from_smem.h"
 #include "gemm_kernel_utils.h"
-#include "mma_from_smem.h"
 #include "transform/tile_smem_loader.h"
 
 #include <inttypes.h>
@@ -56,6 +51,12 @@ constexpr int getWarpsPerSm() {
           ? 16
           : 12);
 }
+static CUTLASS_DEVICE float atomicMaxFloat(float* addr, float value) {
+  // source: https://stackoverflow.com/a/51549250
+  return (value >= 0)
+      ? __int_as_float(atomicMax((int*)addr, __float_as_int(value)))
+      : __uint_as_float(atomicMin((unsigned int*)addr, __float_as_uint(value)));
+}
 } // namespace
 
 template <
@@ -67,8 +68,11 @@ template <
     bool isAligned_,
     int kQueriesPerBlock,
     int kKeysPerBlock,
-    bool kSingleValueIteration // = `value.shape[-1] <= kKeysPerBlock`
-    >
+    bool kSingleValueIteration, // = `value.shape[-1] <= kKeysPerBlock`
+    // This is quite slower on V100 for some reason
+    // Set to false if you know at compile-time you will never need dropout
+    bool kSupportsDropout = true,
+    bool kSupportsBias = true>
 struct AttentionKernel {
   using scalar_t = scalar_t_;
   using accum_t = float;
@@ -126,28 +130,30 @@ struct AttentionKernel {
     int32_t q_strideM;
     int32_t k_strideM;
     int32_t v_strideM;
-    int32_t bias_strideM;
+    int32_t bias_strideM = 0;
 
     // Everything below is only used in `advance_to_block`
     // and shouldn't use registers
     int32_t q_strideH;
     int32_t k_strideH;
     int32_t v_strideH;
-    int32_t bias_strideH;
+    int32_t bias_strideH = 0;
 
     int64_t q_strideB;
     int64_t k_strideB;
     int64_t v_strideB;
-    int32_t bias_strideB;
+    int32_t bias_strideB = 0;
 
     int32_t num_batches;
     int32_t num_heads;
 
     // dropout
     bool use_dropout;
-    at::PhiloxCudaState rng_engine_inputs;
     unsigned long long dropout_batch_head_rng_offset;
     float dropout_prob;
+#ifdef HAS_PYTORCH
+    at::PhiloxCudaState rng_engine_inputs;
+#endif
 
     CUTLASS_HOST_DEVICE int32_t o_strideM() const {
       return head_dim_value * num_heads;
@@ -196,7 +202,7 @@ struct AttentionKernel {
       output_ptr += int64_t(q_start + query_start) * o_strideM() +
           head_id * head_dim_value;
 
-      if (attn_bias_ptr != nullptr) {
+      if (kSupportsBias && attn_bias_ptr != nullptr) {
         attn_bias_ptr += (batch_id * bias_strideB) + (head_id * bias_strideH);
       }
       if (output_accum_ptr != nullptr) {
@@ -212,9 +218,11 @@ struct AttentionKernel {
             batch_id * lse_dim * num_heads + head_id * lse_dim + query_start;
       }
 
-      dropout_batch_head_rng_offset =
-          batch_id * num_heads * num_queries * num_keys +
-          head_id * num_queries * num_keys;
+      if (kSupportsDropout) {
+        dropout_batch_head_rng_offset =
+            batch_id * num_heads * num_queries * num_keys +
+            head_id * num_queries * num_keys;
+      }
 
       num_queries -= query_start;
       if (causal) {
@@ -228,7 +236,9 @@ struct AttentionKernel {
       query_ptr = warp_uniform(query_ptr);
       key_ptr = warp_uniform(key_ptr);
       value_ptr = warp_uniform(value_ptr);
-      attn_bias_ptr = warp_uniform(attn_bias_ptr);
+      if (kSupportsBias) {
+        attn_bias_ptr = warp_uniform(attn_bias_ptr);
+      }
       output_ptr = warp_uniform(output_ptr);
       output_accum_ptr = warp_uniform(output_accum_ptr);
       logsumexp_ptr = warp_uniform(logsumexp_ptr);
@@ -299,10 +309,10 @@ struct AttentionKernel {
     using IteratorA = typename DefaultMma::IteratorA;
     using IteratorB = typename DefaultMma::IteratorB;
     using Mma = typename DefaultMma::ThreadblockMma;
-    using ScalingCoefsUpdater = typename DefaultAttentionScalingCoefsUpdater<
+    using AccumLambdaIterator = typename DefaultMmaAccumLambdaIterator<
         typename Mma::Operator::IteratorC,
         accum_t,
-        kWarpSize>::Updater;
+        kWarpSize>::Iterator;
     static_assert(
         MmaCore::WarpCount::kM * MmaCore::WarpCount::kN *
                 MmaCore::WarpCount::kK ==
@@ -466,6 +476,18 @@ struct AttentionKernel {
     CHECK_ALIGNED_PTR(p.query_ptr, kAlignmentQ);
     CHECK_ALIGNED_PTR(p.key_ptr, kAlignmentK);
     CHECK_ALIGNED_PTR(p.value_ptr, kAlignmentV);
+    if (kSupportsBias) {
+      CHECK_ALIGNED_PTR(p.attn_bias_ptr, kAlignmentQ);
+      XFORMERS_CHECK(
+          p.bias_strideB % kAlignmentQ == 0,
+          "attn_bias is not correctly aligned");
+      XFORMERS_CHECK(
+          p.bias_strideH % kAlignmentQ == 0,
+          "attn_bias is not correctly aligned");
+      XFORMERS_CHECK(
+          p.bias_strideM % kAlignmentQ == 0,
+          "attn_bias is not correctly aligned");
+    }
     XFORMERS_CHECK(
         p.q_strideM % kAlignmentQ == 0, "query is not correctly aligned");
     XFORMERS_CHECK(
@@ -527,8 +549,9 @@ struct AttentionKernel {
               {0, col});
         };
 
+#ifdef HAS_PYTORCH
     curandStatePhilox4_32_10_t curand_state_init;
-    if (p.use_dropout) {
+    if (kSupportsDropout && p.use_dropout) {
       const auto seeds = at::cuda::philox::unpack(p.rng_engine_inputs);
 
       // each element of the attention matrix P with shape
@@ -545,6 +568,7 @@ struct AttentionKernel {
           std::get<1>(seeds) + p.dropout_batch_head_rng_offset,
           &curand_state_init);
     }
+#endif
 
     // Iterate through keys
     for (int32_t iter_key_start = 0; iter_key_start < p.num_keys;
@@ -639,11 +663,13 @@ struct AttentionKernel {
                   (my_warp_id / MM0::Mma::WarpCount::kM)};
 
       // multiply by scaling factor
-      accum =
-          cutlass::multiplies<typename MM0::Mma::FragmentC>()(p.scale, accum);
+      if (kSupportsBias) {
+        accum =
+            cutlass::multiplies<typename MM0::Mma::FragmentC>()(p.scale, accum);
+      }
 
       // apply attention bias if applicable
-      if (p.attn_bias_ptr != nullptr) {
+      if (kSupportsBias && p.attn_bias_ptr != nullptr) {
         // load bias tile Bij into shared memory
         typename MM0::BiasLoader::GmemTileIterator bias_iter(
             {cutlass::layout::RowMajor(p.bias_strideM)},
@@ -660,9 +686,9 @@ struct AttentionKernel {
         MM0::BiasLoader::load(bias_iter, smem_tile_iter);
 
         // Pij += Bij, Pij is in register fragment and Bij is in shared memory
-        auto lane_offset = MM0::ScalingCoefsUpdater::get_lane_offset(
+        auto lane_offset = MM0::AccumLambdaIterator::get_lane_offset(
             lane_id(), warp_id(), iteratorC_tile_offset);
-        MM0::ScalingCoefsUpdater::iterateRows(
+        MM0::AccumLambdaIterator::iterateRows(
             lane_offset,
             [&](int accum_m) {},
             [&](int accum_m, int accum_n, int idx) {
@@ -676,10 +702,10 @@ struct AttentionKernel {
       // Mask out last if causal
       if (p.causal && p.num_keys - iter_key_start <= kKeysPerBlock) {
         auto query_start = blockIdx.x * kQueriesPerBlock;
-        auto lane_offset = MM0::ScalingCoefsUpdater::get_lane_offset(
+        auto lane_offset = MM0::AccumLambdaIterator::get_lane_offset(
             lane_id(), warp_id(), iteratorC_tile_offset);
         int32_t last_col;
-        MM0::ScalingCoefsUpdater::iterateRows(
+        MM0::AccumLambdaIterator::iterateRows(
             lane_offset,
             [&](int accum_m) {
               last_col = query_start + accum_m - iter_key_start;
@@ -699,8 +725,8 @@ struct AttentionKernel {
                           ([&] {
                             // Update `mi` from accum stored in registers
                             // Also does accum[i] <- exp(accum[i] - mi)
-                            MM0::ScalingCoefsUpdater::update<
-                                kQueriesPerBlock,
+                            iterative_softmax<
+                                typename MM0::Mma::Operator::IteratorC,
                                 kFullColumns,
                                 kIsFirst,
                                 kKeepOutputInRF>(
@@ -713,7 +739,8 @@ struct AttentionKernel {
                                 thread_id(),
                                 warp_id(),
                                 p.num_keys - iter_key_start,
-                                iteratorC_tile_offset);
+                                iteratorC_tile_offset,
+                                kSupportsBias ? 1.0f : p.scale);
                           }));
                     }));
 
@@ -729,6 +756,7 @@ struct AttentionKernel {
 
       __syncthreads();
 
+#ifdef HAS_PYTORCH
       // apply dropout (if applicable) after we've written Pij to smem.
       // dropout is applied by multiplying each element of Pij by:
       // - 0 with probability dropout_p
@@ -741,7 +769,7 @@ struct AttentionKernel {
       // it ends up being very slow because each thread having noncontiguous
       // strips of the Pij tile means we have to skip around a lot, and also
       // have to generate a single random number at a time
-      if (p.use_dropout) {
+      if (kSupportsDropout && p.use_dropout) {
         auto si = shared_storage.after_mm0.si.accum_ref();
         // each thread handles a contiguous sequence of elements from Sij, all
         // coming from the same row. the reason they have to come from the same
@@ -789,6 +817,7 @@ struct AttentionKernel {
         }
         __syncthreads(); // p.use_dropout should have same value kernel-wide
       }
+#endif
 
       //
       // MATMUL: Attn . V
@@ -961,6 +990,117 @@ struct AttentionKernel {
     }
   }
 
+  template <
+      typename WarpIteratorC,
+      bool kFullColumns,
+      bool kIsFirst,
+      bool kKeepOutputInRF>
+  CUTLASS_DEVICE static void iterative_softmax(
+      typename WarpIteratorC::Fragment& frag_o, // output so far
+      typename WarpIteratorC::Fragment& frag,
+      cutlass::Array<accum_t, kQueriesPerBlock>& mi,
+      cutlass::Array<accum_t, kQueriesPerBlock>& m_prime,
+      cutlass::Array<accum_t, kQueriesPerBlock>& s_prime,
+      int8_t lane_id,
+      int8_t thread_id,
+      int8_t warp_id,
+      int16_t max_col,
+      typename WarpIteratorC::TensorCoord const& tile_offset,
+      float scaling) {
+    /* Iterates on the accumulator and corresponding position on result matrix
+
+    (1) Update `mi[r]` to the max value of the row `r`
+    (2) In a second iteration do the following:
+        (a) accum   <- exp(accum - mi)
+        (b) m_prime <- exp(m_prime - mi)
+        (c) s_prime <- s_prime * m_prime + sum(accum)
+
+    All of this is done on registers, before we store all of this
+    on shared memory for the next matmul with Value.
+    */
+    using Fragment = typename WarpIteratorC::Fragment;
+    using LambdaIterator = typename DefaultMmaAccumLambdaIterator<
+        WarpIteratorC,
+        accum_t,
+        kWarpSize>::Iterator;
+    // Convert to `accum_t` (rather than double)
+    constexpr float kLog2e = 1.4426950408889634074; // log_2(e) = M_LOG2E
+    if (!kIsFirst) {
+      if (thread_id < kQueriesPerBlock) {
+        m_prime[thread_id] = mi[thread_id];
+      }
+      __syncthreads();
+    }
+
+    auto lane_offset =
+        LambdaIterator::get_lane_offset(lane_id, warp_id, tile_offset);
+
+    // First update `mi` to the max per-row
+    {
+      accum_t max;
+      LambdaIterator::iterateRows(
+          lane_offset,
+          [&](int accum_m) {
+            max = -cutlass::platform::numeric_limits<accum_t>::infinity();
+          },
+          [&](int accum_m, int accum_n, int idx) {
+            if (kFullColumns || accum_n < max_col) {
+              max = cutlass::fast_max(max, frag[idx]);
+            }
+          },
+          [&](int accum_m) {
+            // Having 4x atomicMax seems faster than reduce within warp
+            // first...
+            atomicMaxFloat(&mi[accum_m], max * scaling);
+          });
+    }
+    frag = cutlass::multiplies<Fragment>()(scaling * kLog2e, frag);
+
+    // Make sure we all share the update values for `mi`
+    __syncthreads();
+
+    if (thread_id < kQueriesPerBlock) {
+      auto m_prime_exp = exp2f(kLog2e * (m_prime[thread_id] - mi[thread_id]));
+      m_prime[thread_id] = m_prime_exp;
+      s_prime[thread_id] *= m_prime_exp;
+    }
+    __syncthreads(); // Update output fragments
+    if (kKeepOutputInRF && !kIsFirst) {
+      accum_t mp;
+      LambdaIterator::iterateRows(
+          lane_offset,
+          [&](int accum_m) { mp = m_prime[accum_m]; },
+          [&](int accum_m, int accum_n, int idx) { frag_o[idx] *= mp; },
+          [&](int accum_m) {});
+      __syncthreads();
+    }
+    // Update accum_m, accum_n, ...
+    {
+      accum_t mi_row, total_row;
+      LambdaIterator::iterateRows(
+          lane_offset,
+          [&](int accum_m) { mi_row = kLog2e * mi[accum_m]; },
+          [&](int accum_m, int accum_n, int idx) {
+            frag[idx] = (kFullColumns || accum_n < max_col)
+                ? exp2f(frag[idx] - mi_row)
+                : accum_t(0.0);
+          },
+          [&](int accum_m) {});
+      LambdaIterator::iterateRows(
+          lane_offset,
+          [&](int accum_m) { total_row = 0.0; },
+          [&](int accum_m, int accum_n, int idx) { total_row += frag[idx]; },
+          [&](int accum_m) {
+            if (LambdaIterator::reduceSameRow(
+                    lane_id, total_row, [](accum_t a, accum_t b) {
+                      return a + b;
+                    })) {
+              atomicAdd(&s_prime[accum_m], total_row);
+            }
+          });
+    }
+  }
+
   static CUTLASS_DEVICE int8_t lane_id() {
     return threadIdx.x;
   }
@@ -984,89 +1124,3 @@ __global__ void __launch_bounds__(AK::kNumThreads, AK::kMinBlocksPerSm)
 template <typename AK>
 __global__ void __launch_bounds__(AK::kNumThreads, AK::kMinBlocksPerSm)
     attention_kernel_batched(typename AK::Params params);
-
-#define _ATTENTION_KERNEL_FORWARD_BEGIN(...)                                  \
-  template <>                                                                 \
-  __global__ void __launch_bounds__(                                          \
-      __VA_ARGS__::kNumThreads, __VA_ARGS__::kMinBlocksPerSm)                 \
-      attention_kernel_batched<__VA_ARGS__>(typename __VA_ARGS__::Params p) { \
-    using Kernel = __VA_ARGS__;
-#define _ATTENTION_KERNEL_FORWARD_END() }
-
-#ifdef __CUDA_ARCH__
-#define __CUDA_ARCH_OR_ZERO__ __CUDA_ARCH__
-#else
-#define __CUDA_ARCH_OR_ZERO__ 0
-#endif
-
-#define INSTANTIATE_ATTENTION_KERNEL_FORWARD(              \
-    ARCH,                                                  \
-    SCALAR_T,                                              \
-    IS_ALIGNED,                                            \
-    QUERIES_PER_BLOCK,                                     \
-    KEYS_PER_BLOCK,                                        \
-    SINGLE_VALUE_ITER)                                     \
-  _ATTENTION_KERNEL_FORWARD_BEGIN(AttentionKernel<         \
-                                  SCALAR_T,                \
-                                  cutlass::arch::Sm##ARCH, \
-                                  IS_ALIGNED,              \
-                                  QUERIES_PER_BLOCK,       \
-                                  KEYS_PER_BLOCK,          \
-                                  SINGLE_VALUE_ITER>)      \
-  if (!p.advance_to_block()) {                             \
-    return;                                                \
-  }                                                        \
-  Kernel::attention_kernel(p);                             \
-  _ATTENTION_KERNEL_FORWARD_END();
-
-#define INSTANTIATE_ATTENTION_KERNEL_FORWARD_DISABLED(              \
-    ARCH,                                                           \
-    SCALAR_T,                                                       \
-    IS_ALIGNED,                                                     \
-    QUERIES_PER_BLOCK,                                              \
-    KEYS_PER_BLOCK,                                                 \
-    SINGLE_VALUE_ITER)                                              \
-  _ATTENTION_KERNEL_FORWARD_BEGIN(AttentionKernel<                  \
-                                  SCALAR_T,                         \
-                                  cutlass::arch::Sm##ARCH,          \
-                                  IS_ALIGNED,                       \
-                                  QUERIES_PER_BLOCK,                \
-                                  KEYS_PER_BLOCK,                   \
-                                  SINGLE_VALUE_ITER>)               \
-  printf(                                                           \
-      "FATAL: this function is for sm%d, but was built for sm%d\n", \
-      int(ARCH),                                                    \
-      int(__CUDA_ARCH_OR_ZERO__));                                  \
-  _ATTENTION_KERNEL_FORWARD_END();
-
-// All kernels are disabled by default
-#define INSTANTIATE_ATTENTION_KERNEL_FORWARD_SM50(...) \
-  INSTANTIATE_ATTENTION_KERNEL_FORWARD_DISABLED(50, __VA_ARGS__)
-#define INSTANTIATE_ATTENTION_KERNEL_FORWARD_SM70(...) \
-  INSTANTIATE_ATTENTION_KERNEL_FORWARD_DISABLED(70, __VA_ARGS__)
-#define INSTANTIATE_ATTENTION_KERNEL_FORWARD_SM75(...) \
-  INSTANTIATE_ATTENTION_KERNEL_FORWARD_DISABLED(75, __VA_ARGS__)
-#define INSTANTIATE_ATTENTION_KERNEL_FORWARD_SM80(...) \
-  INSTANTIATE_ATTENTION_KERNEL_FORWARD_DISABLED(80, __VA_ARGS__)
-
-// Enable the right one based on __CUDA_ARCH__
-#ifndef __CUDA_ARCH__
-#elif __CUDA_ARCH__ < 500
-#error "Need cuda arch at least 5.0"
-#elif __CUDA_ARCH__ < 700
-#undef INSTANTIATE_ATTENTION_KERNEL_FORWARD_SM50
-#define INSTANTIATE_ATTENTION_KERNEL_FORWARD_SM50(...) \
-  INSTANTIATE_ATTENTION_KERNEL_FORWARD(50, __VA_ARGS__)
-#elif __CUDA_ARCH__ < 750
-#undef INSTANTIATE_ATTENTION_KERNEL_FORWARD_SM70
-#define INSTANTIATE_ATTENTION_KERNEL_FORWARD_SM70(...) \
-  INSTANTIATE_ATTENTION_KERNEL_FORWARD(70, __VA_ARGS__)
-#elif __CUDA_ARCH__ < 800
-#undef INSTANTIATE_ATTENTION_KERNEL_FORWARD_SM75
-#define INSTANTIATE_ATTENTION_KERNEL_FORWARD_SM75(...) \
-  INSTANTIATE_ATTENTION_KERNEL_FORWARD(75, __VA_ARGS__)
-#elif __CUDA_ARCH__ >= 800
-#undef INSTANTIATE_ATTENTION_KERNEL_FORWARD_SM80
-#define INSTANTIATE_ATTENTION_KERNEL_FORWARD_SM80(...) \
-  INSTANTIATE_ATTENTION_KERNEL_FORWARD(80, __VA_ARGS__)
-#endif
